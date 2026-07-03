@@ -1,0 +1,50 @@
+# /etc/systemd/system/digimon-bot.service
+#
+# Install:
+#   sudo cp digimon-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now digimon-bot
+#
+# Logs:
+#   journalctl -u digimon-bot -f
+#
+# This gives you auto-start on boot and auto-restart on crash, without Docker.
+
+[Unit]
+Description=Digimon TCG Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Security hardening ---
+# Run as a dedicated, unprivileged user (create with: sudo useradd -r -m -s /usr/sbin/nologin botuser)
+User=botuser
+Group=botuser
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/digimon-bot
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# --- Where the bot lives and how it runs ---
+WorkingDirectory=/opt/digimon-bot
+EnvironmentFile=/opt/digimon-bot/.env
+ExecStart=/opt/digimon-bot/venv/bin/python /opt/digimon-bot/bot.py
+
+# --- Reliability: always come back up ---
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

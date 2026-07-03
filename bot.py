@@ -33,6 +33,7 @@ import asyncio
 import logging
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -41,6 +42,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+HEALTHCHECK_PORT = int(os.getenv("HEALTHCHECK_PORT", "8080"))
 
 SEARCH_URL = "https://digimoncard.io/api-public/search.php"
 ALL_CARDS_URL = "https://digimoncard.io/api-public/getAllCards"
@@ -377,6 +379,7 @@ async def card_prefix(ctx: commands.Context, *, query: str):
 # --------------------------------------------------------------------------
 
 _cache_refresher_started = False
+_healthcheck_started = False
 
 
 async def periodic_cache_refresh():
@@ -387,9 +390,29 @@ async def periodic_cache_refresh():
         await refresh_all_cards()
 
 
+async def start_healthcheck_server():
+    """Tiny HTTP server so external uptime monitors (UptimeRobot, Docker
+    healthcheck, etc.) can verify the bot process is alive and actually
+    connected to Discord — not just that the process exists."""
+    async def health(request):
+        healthy = bot.is_ready() and not bot.is_closed()
+        return web.json_response(
+            {"status": "ok" if healthy else "not_ready", "latency_ms": round(bot.latency * 1000, 1)},
+            status=200 if healthy else 503,
+        )
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTHCHECK_PORT)
+    await site.start()
+    log.info("Healthcheck server listening on :%d/health", HEALTHCHECK_PORT)
+
+
 @bot.event
 async def on_ready():
-    global _cache_refresher_started
+    global _cache_refresher_started, _healthcheck_started
 
     try:
         synced = await bot.tree.sync()
@@ -403,6 +426,10 @@ async def on_ready():
     if not _cache_refresher_started:
         bot.loop.create_task(periodic_cache_refresh())
         _cache_refresher_started = True
+
+    if not _healthcheck_started:
+        bot.loop.create_task(start_healthcheck_server())
+        _healthcheck_started = True
 
     log.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
 

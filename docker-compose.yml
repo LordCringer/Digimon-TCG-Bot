@@ -1,0 +1,19 @@
+services:
+  digimon-bot:
+    build: .
+    container_name: digimon-bot
+    restart: unless-stopped        # auto-restarts on crash or host reboot
+    env_file:
+      - .env                       # DISCORD_BOT_TOKEN lives here, never in this file
+    ports:
+      - "127.0.0.1:8080:8080"      # healthcheck endpoint, bound to localhost only
+    read_only: true                # container filesystem can't be modified at runtime
+    security_opt:
+      - no-new-privileges:true     # blocks privilege escalation inside the container
+    cap_drop:
+      - ALL                        # strip all Linux capabilities the bot doesn't need
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"            # prevent logs from filling the disk
+        max-file: "3"
