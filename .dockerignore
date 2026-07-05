@@ -1,0 +1,7 @@
+.env
+.env.example
+.git
+__pycache__/
+*.pyc
+README.md
+digimon-bot.service

@@ -16,6 +16,8 @@ Usage in Discord:
     /card name:Aldamon
     /card name:Aldamon set:BT4
     /card name:Omnimon set:booster great legend
+    /release
+    /ruling card_id:BT4-016
 
     As you type in the `name` field, Discord suggests matching cards in
     the form "Aldamon — BT4-016" — the set/print code is shown right in
@@ -29,11 +31,15 @@ Usage in Discord:
 """
 
 import os
+import re
+import random
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
+from bs4 import BeautifulSoup
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -44,9 +50,21 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 HEALTHCHECK_PORT = int(os.getenv("HEALTHCHECK_PORT", "8080"))
 
+# Every /ruling result pings these two people (by Discord username, resolved
+# to a real mention at runtime by looking them up in the server's member
+# list). There's also a 15% chance of additionally tagging a third person
+# as a standing joke about their ruling track record — purely cosmetic,
+# doesn't affect the actual ruling data returned.
+RULING_PING_USERNAMES = ["zaneal", "taiyoukai99"]
+RULING_BONUS_PING_USERNAME = "finn_thewhoman"
+RULING_BONUS_PING_CHANCE = 0.15
+
 SEARCH_URL = "https://digimoncard.io/api-public/search.php"
 ALL_CARDS_URL = "https://digimoncard.io/api-public/getAllCards"
 IMAGE_URL_TEMPLATE = "https://world.digimoncard.com/images/cardlist/card/{code}.png"
+PACKS_URL = "https://digimoncard.io/packs"
+TCGPLAYER_PRODUCT_URL = "https://www.tcgplayer.com/product/{product_id}"
+OFFICIAL_RULINGS_URL = "https://world.digimoncard.com/cards/"
 
 # Only include cards from the current (2020 reboot) Digimon Card Game.
 # This deliberately excludes both older lines this API tracks:
@@ -62,6 +80,89 @@ CURRENT_SERIES = "Digimon Card Game"
 # periodically in the background (card lists grow with new set releases).
 # Each entry: {"name": "Aldamon", "id": "BT4-016"}
 ALL_CARDS: list[dict] = []
+
+# Maps a card ID's set-code prefix (e.g. "BT4", "EX11", "ST7") to the exact
+# label Bandai's official site uses for that set on world.digimoncard.com,
+# used as the `notes` query param when looking up official rulings. Sourced
+# directly from the set list at https://world.digimoncard.com/rule/ — Bandai
+# is inconsistent about hyphens (older sets omit them, e.g. "[BT04]" vs
+# "[BT-24]"), so this table exists rather than trying to derive the label.
+SET_NOTES_MAP = {
+    "BT25": "BOOSTER DUAL REVOLUTION [BT-25]",
+    "AD1": "Advanced Booster DIGIMON GENERATION [AD-01]",
+    "EX11": "EXTRA BOOSTER DAWN OF LIBERATOR [EX-11]",
+    "BT24": "BOOSTER TIME STRANGER [BT-24]",
+    "BT23": "BOOSTER HACKERS' SLUMBER [BT-23]",
+    "EX10": "EXTRA BOOSTER SINISTER ORDER [EX-10]",
+    "BT22": "BOOSTER CYBER EDEN [BT-22]",
+    "EX9": "EXTRA BOOSTER VERSUS MONSTERS [EX-09]",
+    "EX09": "EXTRA BOOSTER VERSUS MONSTERS [EX-09]",
+    "BT21": "WORLD CONVERGENCE [BT-21]",
+    "EX8": "EXTRA BOOSTER CHAIN OF LIBERATION [EX08]",
+    "EX08": "EXTRA BOOSTER CHAIN OF LIBERATION [EX08]",
+    "EX7": "EXTRA BOOSTER DIGIMON LIBERATOR [EX07]",
+    "EX07": "EXTRA BOOSTER DIGIMON LIBERATOR [EX07]",
+    "BT17": "BOOSTER SECRET CRISIS [BT17]",
+    "EX6": "THEME BOOSTER INFERNAL ASCENSION [EX06]",
+    "EX06": "THEME BOOSTER INFERNAL ASCENSION [EX06]",
+    "BT16": "BOOSTER BEGINNING OBSERVER [BT16]",
+    "BT15": "BOOSTER EXCEED APOCALYPSE [BT15]",
+    "EX5": "THEME BOOSTER ANIMAL COLOSSEUM [EX05]",
+    "EX05": "THEME BOOSTER ANIMAL COLOSSEUM [EX05]",
+    "BT14": "BOOSTER BLAST ACE [BT14]",
+    "RB1": "RESURGENCE BOOSTER [RB01]",
+    "RB01": "RESURGENCE BOOSTER [RB01]",
+    "BT13": "BOOSTER VERSUS ROYAL KNIGHTS [BT13]",
+    "EX4": "THEME BOOSTER ALTERNATIVE BEING [EX04]",
+    "EX04": "THEME BOOSTER ALTERNATIVE BEING [EX04]",
+    "BT12": "BOOSTER ACROSS TIME [BT12]",
+    "BT11": "BOOSTER DIMENSIONAL PHASE [BT11]",
+    "EX3": "THEME BOOSTER DRACONIC ROAR [EX-03]",
+    "EX03": "THEME BOOSTER DRACONIC ROAR [EX-03]",
+    "BT10": "BOOSTER Xros Encounter [BT10]",
+    "BT9": "BOOSTER X RECORD [BT09]",
+    "BT09": "BOOSTER X RECORD [BT09]",
+    "EX2": "THEME BOOSTER DIGITAL HAZARD [EX-02]",
+    "EX02": "THEME BOOSTER DIGITAL HAZARD [EX-02]",
+    "BT8": "BOOSTER NEW AWAKENING [BT08]",
+    "BT08": "BOOSTER NEW AWAKENING [BT08]",
+    "BT7": "BOOSTER NEXT ADVENTURE [BT07]",
+    "BT07": "BOOSTER NEXT ADVENTURE [BT07]",
+    "EX1": "THEME BOOSTER CLASSIC COLLECTION [EX-01]",
+    "EX01": "THEME BOOSTER CLASSIC COLLECTION [EX-01]",
+    "BT6": "BOOSTER DOUBLE DIAMOND [BT06]",
+    "BT06": "BOOSTER DOUBLE DIAMOND [BT06]",
+    "BT5": "BOOSTER BATTLE OF OMNI [BT05]",
+    "BT05": "BOOSTER BATTLE OF OMNI [BT05]",
+    "BT4": "BOOSTER GREAT LEGEND [BT04]",
+    "BT04": "BOOSTER GREAT LEGEND [BT04]",
+    "BT1": "RELEASE SPECIAL BOOSTER [BT01-03]",
+    "BT2": "RELEASE SPECIAL BOOSTER [BT01-03]",
+    "BT3": "RELEASE SPECIAL BOOSTER [BT01-03]",
+    "ST24": "Starter Deck DIGIMON DATA SQUAD [ST-24]",
+    "ST23": "Starter Deck DIGIMON BEATBREAK [ST-23]",
+    "ST22": "Advanced Deck AMETHYST MANDALA [ST-22]",
+    "ST21": "HERO OF HOPE [ST-21]",
+    "ST20": "PROTECTOR OF LIGHT [ST-20]",
+    "ST19": "Starter Deck FABLE WALTZ [ST19]",
+    "ST18": "Starter Deck GUARDIAN VORTEX [ST18]",
+    "ST17": "Advanced Deck DOUBLE TYPHOON [ST17]",
+    "ST16": "Starter Deck Wolf of Friendship [ST16]",
+    "ST15": "Starter Deck Dragon of Courage [ST15]",
+    "ST14": "Advanced Deck Beelzemon [ST14]",
+    "ST13": "Starter Deck RagnaLoardmon [ST-13]",
+    "ST12": "Starter Deck Jesmon [ST-12]",
+    "ST10": "Starter Deck PARALLEL WORLD TACTICIAN [ST-10]",
+    "ST9": "Starter Deck ULTIMATE ANCIENT DRAGON [ST-9]",
+    "ST8": "Starter Deck ULFORCEVEEDRAMON [ST-8]",
+    "ST7": "Starter Deck GALLANTMON [ST-7]",
+    "ST6": "Starter Deck VENOMOUS VIOLET [ST-6]",
+    "ST5": "Starter Deck MACHINE BLACK [ST-5]",
+    "ST4": "Starter Deck GIGA GREEN [ST-4]",
+    "ST3": "Starter Deck HEAVEN'S YELLOW [ST-3]",
+    "ST2": "Starter Deck COCYTUS BLUE [ST-2]",
+    "ST1": "Starter Deck GAIA RED [ST-1]",
+}
 
 COLOR_HEX = {
     "Red": 0xE0403C,
@@ -89,7 +190,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 def _merge_card_rows(rows: list[dict]) -> list[dict]:
     """Collapse raw API rows (one row per TCGPlayer SKU/printing variant)
-    down to one entry per unique card id, merging set names together."""
+    down to one entry per unique card id, merging set names together.
+
+    Each merged card also keeps a `variants` list — the distinct physical
+    prints of that card id (e.g. standard vs "Alternate Art" vs "Box
+    Topper"), each tagged with its own TCGplayer product id. This powers
+    the Alternative Art cycling feature: the base game data (name, effect
+    text, rarity) is identical across variants, but each has its own
+    real photo on TCGplayer, which digimoncard.io and Bandai's own site
+    don't expose separately.
+    """
     merged: dict[str, dict] = {}
     for card in rows:
         cid = card.get("id")
@@ -106,10 +216,35 @@ def _merge_card_rows(rows: list[dict]) -> list[dict]:
                 "rarity": card.get("rarity"),
                 "stage": card.get("stage"),
                 "set_names": set(card.get("set_name") or []),
+                "variants": [],
+                "_seen_variant_ids": set(),
             }
-        else:
-            merged[cid]["set_names"].update(card.get("set_name") or [])
-    return list(merged.values())
+        entry = merged[cid]
+        entry["set_names"].update(card.get("set_name") or [])
+
+        tcg_id = card.get("tcgplayer_id")
+        tcg_name = card.get("tcgplayer_name") or entry["name"]
+        if tcg_id and tcg_id not in entry["_seen_variant_ids"]:
+            entry["_seen_variant_ids"].add(tcg_id)
+            # Label is whatever's in parentheses in tcgplayer_name (e.g.
+            # "Alternate Art", "Box Topper"), or "Standard" if the name
+            # matches the base card name with no extra qualifier.
+            match = re.search(r"\(([^)]+)\)\s*$", tcg_name)
+            label = match.group(1) if match else "Standard"
+            entry["variants"].append({
+                "label": label,
+                "tcgplayer_id": tcg_id,
+                "rarity": card.get("rarity"),
+            })
+
+    results = []
+    for entry in merged.values():
+        del entry["_seen_variant_ids"]
+        # Standard/base print first, then everything else in the order
+        # the API returned it.
+        entry["variants"].sort(key=lambda v: 0 if v["label"] == "Standard" else 1)
+        results.append(entry)
+    return results
 
 
 async def _search_api(session: aiohttp.ClientSession, params: dict) -> list[dict]:
@@ -185,14 +320,19 @@ def filter_by_set(cards: list[dict], set_query: str) -> list[dict]:
     return results
 
 
-def build_embed(card: dict) -> discord.Embed:
+def build_embed(card: dict, variant_index: int = 0) -> discord.Embed:
     color = COLOR_HEX.get(card.get("color"), 0x5865F2)
     sets = ", ".join(sorted(card["set_names"])) or "Unknown set"
 
-    embed = discord.Embed(
-        title=f"{card['name']} — {card['id']}",
-        color=color,
-    )
+    variants = card.get("variants") or []
+    variant = variants[variant_index] if variants else None
+    is_alt = variant and variant["label"] != "Standard"
+
+    title = f"{card['name']} — {card['id']}"
+    if is_alt:
+        title += f" ({variant['label']})"
+
+    embed = discord.Embed(title=title, color=color)
     embed.set_image(url=IMAGE_URL_TEMPLATE.format(code=card["id"]))
 
     details = []
@@ -204,14 +344,66 @@ def build_embed(card: dict) -> discord.Embed:
         details.append(f"**DP:** {card['dp']}")
     if card.get("color"):
         details.append(f"**Color:** {card['color']}")
-    if card.get("rarity"):
-        details.append(f"**Rarity:** {card['rarity']}")
+    rarity = variant["rarity"] if variant else card.get("rarity")
+    if rarity:
+        details.append(f"**Rarity:** {rarity}")
     if details:
         embed.add_field(name="Details", value="\n".join(details), inline=True)
 
     embed.add_field(name="Set(s)", value=sets, inline=True)
-    embed.set_footer(text="Card data: digimoncard.io  •  Images: world.digimoncard.com")
+
+    if is_alt and variant.get("tcgplayer_id"):
+        tcg_url = TCGPLAYER_PRODUCT_URL.format(product_id=variant["tcgplayer_id"])
+        embed.add_field(
+            name="Alternate Art",
+            value=(
+                f"The image above is the standard print. "
+                f"[View the actual {variant['label']} photo on TCGplayer]({tcg_url})."
+            ),
+            inline=False,
+        )
+
+    footer = "Card data: digimoncard.io  •  Images: world.digimoncard.com"
+    if len(variants) > 1:
+        footer += f"  •  Print {variant_index + 1}/{len(variants)}"
+    embed.set_footer(text=footer)
     return embed
+
+
+class ArtCycleView(discord.ui.View):
+    """Lets the user cycle between known prints/art variants of a card
+    (standard, Alternate Art, Box Topper, event promos, etc.) using
+    Prev/Next buttons. Only attached to a message when a card actually
+    has more than one known variant."""
+
+    def __init__(self, card: dict, requester_id: int, variant_index: int = 0):
+        super().__init__(timeout=120)
+        self.card = card
+        self.requester_id = requester_id
+        self.variant_index = variant_index
+
+    @discord.ui.button(label="◀ Prev Art", style=discord.ButtonStyle.secondary)
+    async def prev_art(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._cycle(interaction, -1)
+
+    @discord.ui.button(label="Next Art ▶", style=discord.ButtonStyle.secondary)
+    async def next_art(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._cycle(interaction, 1)
+
+    async def _cycle(self, interaction: discord.Interaction, direction: int):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can cycle art for this card.",
+                ephemeral=True,
+            )
+            return
+        variants = self.card.get("variants") or []
+        if not variants:
+            await interaction.response.defer()
+            return
+        self.variant_index = (self.variant_index + direction) % len(variants)
+        embed = build_embed(self.card, self.variant_index)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 def format_matches_message(query: str, cards: list[dict]) -> str:
@@ -241,10 +433,11 @@ def format_matches_message(query: str, cards: list[dict]) -> str:
 # --------------------------------------------------------------------------
 
 async def do_lookup(query: str, set_query: str | None):
-    """Returns (embed_or_none, matches_or_none, error_message_or_none).
+    """Returns (card_or_none, matches_or_none, error_message_or_none).
 
-    `matches` is only populated when multiple cards still match after
-    filtering — callers should render it as a plain text list (see
+    `card` is the single resolved card dict (build the embed/view from it
+    yourself). `matches` is only populated when multiple cards still match
+    after filtering — callers should render it as a plain text list (see
     format_matches_message), not an interactive component.
     """
     if not query or not query.strip():
@@ -279,7 +472,7 @@ async def do_lookup(query: str, set_query: str | None):
         cards = filtered
 
     if len(cards) == 1:
-        return build_embed(cards[0]), None, None
+        return cards[0], None, None
 
     return None, cards, None
 
@@ -335,17 +528,231 @@ async def name_autocomplete(
 @app_commands.autocomplete(name=name_autocomplete)
 async def card_slash(interaction: discord.Interaction, name: str, set: str = None):
     await interaction.response.defer()
-    embed, matches, error = await do_lookup(name, set)
+    card, matches, error = await do_lookup(name, set)
 
     if error:
         await interaction.followup.send(error)
         return
 
-    if embed:
-        await interaction.followup.send(embed=embed)
+    if card:
+        embed = build_embed(card)
+        view = ArtCycleView(card, interaction.user.id) if len(card.get("variants") or []) > 1 else None
+        await interaction.followup.send(embed=embed, view=view)
         return
 
     await interaction.followup.send(format_matches_message(name, matches))
+
+
+# --------------------------------------------------------------------------
+# Set release schedule
+# --------------------------------------------------------------------------
+
+async def fetch_set_schedule(session: aiohttp.ClientSession) -> list[dict]:
+    """Scrapes digimoncard.io's Card Sets page (default sort = newest
+    first), which lists every set with its release date, including
+    already-announced future releases. Returns a list of
+    {"name": str, "date": datetime, "date_text": str}."""
+    try:
+        async with session.get(PACKS_URL, timeout=15) as resp:
+            if resp.status != 200:
+                return []
+            html = await resp.text()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        log.warning("Failed to fetch set schedule: %s", e)
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return []
+
+    sets = []
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 3:
+            continue
+        link = cells[1].find("a")
+        name = link.get_text(strip=True) if link else cells[1].get_text(strip=True)
+        date_text = cells[2].get_text(strip=True)
+        try:
+            date_obj = datetime.strptime(date_text, "%b %d, %Y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        sets.append({"name": name, "date": date_obj, "date_text": date_text})
+    return sets
+
+
+@bot.tree.command(name="release", description="Show upcoming Digimon TCG set release dates.")
+async def release_slash(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+        sets = await fetch_set_schedule(session)
+
+    if not sets:
+        await interaction.followup.send(
+            "Couldn't fetch the release schedule right now. Try again later."
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    upcoming = sorted((s for s in sets if s["date"] >= now), key=lambda s: s["date"])
+
+    embed = discord.Embed(title="📅 Upcoming Digimon TCG Set Releases", color=0x5865F2)
+
+    if upcoming:
+        lines = [f"**{s['date_text']}** — {s['name']}" for s in upcoming[:12]]
+        embed.description = "\n".join(lines)
+    else:
+        # Nothing announced yet — show the most recent releases instead
+        recent = sorted(sets, key=lambda s: s["date"], reverse=True)[:8]
+        lines = [f"**{s['date_text']}** — {s['name']}" for s in recent]
+        embed.description = "No upcoming releases are announced yet. Most recent sets:\n" + "\n".join(lines)
+
+    embed.set_footer(text="Source: digimoncard.io/packs")
+    await interaction.followup.send(embed=embed)
+
+
+# --------------------------------------------------------------------------
+# Official rulings lookup
+# --------------------------------------------------------------------------
+
+def _set_code_from_card_id(card_id: str) -> str | None:
+    """Extracts the set-code prefix from a card id, e.g. 'BT4-016' -> 'BT4',
+    'EX11-045' -> 'EX11', 'ST7-09' -> 'ST7'."""
+    match = re.match(r"^([A-Za-z]+\d+)-", card_id)
+    return match.group(1).upper() if match else None
+
+
+async def fetch_card_ruling(session: aiohttp.ClientSession, card_id: str) -> list[dict]:
+    """Scrapes Bandai's official Card Q&A for one specific card, by
+    fetching that card's full set page and extracting just the Q&A block
+    following that card's own entry. Returns a list of
+    {"question": str, "answer": str, "date": str}, or [] if none found
+    (either the card has no published rulings, or the page layout has
+    changed since this was written).
+    """
+    set_code = _set_code_from_card_id(card_id)
+    notes_label = SET_NOTES_MAP.get(set_code) if set_code else None
+    if not notes_label:
+        return []
+
+    try:
+        async with session.get(
+            OFFICIAL_RULINGS_URL,
+            params={"search": "true", "notes": notes_label},
+            timeout=15,
+        ) as resp:
+            if resp.status != 200:
+                return []
+            html = await resp.text()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        log.warning("Failed to fetch rulings page: %s", e)
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+
+    # Find this specific card's block: it starts at "{card_id} ·" (id
+    # followed by its rarity, e.g. "BT4-016 · SR ·") and runs until the
+    # next card's own id-prefix pattern begins.
+    start_match = re.search(rf"{re.escape(card_id)}\s*·", text)
+    if not start_match:
+        return []
+
+    rest = text[start_match.end():]
+    next_card_match = re.search(r"[A-Z]{1,3}\d+-\d+\s*·", rest)
+    block = rest[:next_card_match.start()] if next_card_match else rest
+
+    qa_pattern = re.compile(
+        r"Q(\d+)\s*·\s*([A-Za-z]{3}\.?\s*\d{1,2},\s*\d{4})\s*·\s*(.*?)(?=Q\d+\s*·|\Z)",
+        re.DOTALL,
+    )
+    rulings = []
+    for qa_match in qa_pattern.finditer(block):
+        q_num, date_text, body = qa_match.groups()
+        rulings.append({
+            "id": q_num,
+            "date": date_text.strip(),
+            "text": body.strip(),
+        })
+    return rulings
+
+
+def _resolve_mention(guild: discord.Guild | None, username: str) -> str:
+    """Looks up a member by their exact Discord username (not display
+    name/nickname) and returns a real @mention if found. Falls back to
+    plain text if the person isn't in this server or the command was run
+    in a DM — a non-functional @name is better than a silent failure."""
+    if guild:
+        member = discord.utils.find(
+            lambda m: m.name.lower() == username.lower(), guild.members
+        )
+        if member:
+            return member.mention
+    return f"@{username}"
+
+
+def build_ruling_ping_line(guild: discord.Guild | None) -> str:
+    """Builds the mention line attached to every /ruling result: the two
+    standing pings, plus a 15% chance of a bonus joke ping."""
+    mentions = [_resolve_mention(guild, u) for u in RULING_PING_USERNAMES]
+    line = " ".join(mentions)
+    if random.random() < RULING_BONUS_PING_CHANCE:
+        bonus_mention = _resolve_mention(guild, RULING_BONUS_PING_USERNAME)
+        line += f" {bonus_mention} (for incorrect ruling 😏)"
+    return line
+
+
+@bot.tree.command(name="ruling", description="Look up official rulings (Card Q&A) for a Digimon TCG card.")
+@app_commands.describe(
+    card_id="Exact card number, e.g. BT4-016 (pick a suggestion to get the exact number)",
+)
+@app_commands.autocomplete(card_id=name_autocomplete)
+async def ruling_slash(interaction: discord.Interaction, card_id: str):
+    await interaction.response.defer()
+    card_id = card_id.strip()
+
+    set_code = _set_code_from_card_id(card_id)
+    if not set_code or set_code not in SET_NOTES_MAP:
+        await interaction.followup.send(
+            f"I don't have a rulings lookup mapped for that card's set yet. "
+            f"You can search manually at {OFFICIAL_RULINGS_URL}?search=true"
+        )
+        return
+
+    async with aiohttp.ClientSession() as session:
+        rulings = await fetch_card_ruling(session, card_id)
+
+    notes_label = SET_NOTES_MAP[set_code]
+    source_url = f"{OFFICIAL_RULINGS_URL}?search=true&notes={notes_label.replace(' ', '+')}"
+
+    if not rulings:
+        ping_line = build_ruling_ping_line(interaction.guild)
+        await interaction.followup.send(
+            f"{ping_line}\n"
+            f"No published rulings found for **{card_id}**. "
+            f"Either none have been issued yet, or you can double check on the official set page: {source_url}"
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"📖 Official Rulings — {card_id}",
+        color=0x5865F2,
+        description=f"[View full set rulings page]({source_url})",
+    )
+    for ruling in rulings[:5]:
+        embed.add_field(
+            name=f"Q{ruling['id']} ({ruling['date']})",
+            value=ruling["text"][:1000],
+            inline=False,
+        )
+    if len(rulings) > 5:
+        embed.set_footer(text=f"+{len(rulings) - 5} more — see the full set page above.")
+    else:
+        embed.set_footer(text="Source: world.digimoncard.com (official)")
+
+    await interaction.followup.send(content=build_ruling_ping_line(interaction.guild), embed=embed)
 
 
 # --------------------------------------------------------------------------
@@ -361,14 +768,16 @@ async def card_prefix(ctx: commands.Context, *, query: str):
         name, set_query = query.strip(), None
 
     async with ctx.typing():
-        embed, matches, error = await do_lookup(name, set_query)
+        card, matches, error = await do_lookup(name, set_query)
 
     if error:
         await ctx.send(error)
         return
 
-    if embed:
-        await ctx.send(embed=embed)
+    if card:
+        embed = build_embed(card)
+        view = ArtCycleView(card, ctx.author.id) if len(card.get("variants") or []) > 1 else None
+        await ctx.send(embed=embed, view=view)
         return
 
     await ctx.send(format_matches_message(name, matches))

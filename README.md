@@ -8,24 +8,59 @@ set, and posts the official card image straight into chat.
 
 ## Commands
 
-**Slash command (recommended):**
+## Commands
+
+**Card lookup:**
 ```
 /card name:Aldamon
 /card name:Aldamon set:BT4
 /card name:Omnimon set:"Great Legend"
 ```
-
 As you type in the `name` field, Discord shows a live dropdown of matching
 cards in the form `Aldamon — BT4-016` — the set/print code is shown right
 in the suggestion, so duplicate names are easy to tell apart before you
 even hit enter. Picking a suggestion jumps straight to that exact card —
-no extra "which one did you mean" step.
+no extra "which one did you mean" step. If you type a name manually
+without using a suggestion and it still matches more than one printing,
+the bot replies with a plain text list (showing each match's set) instead
+of an interactive picker.
 
-If you type a name manually without using a suggestion and it still
-matches more than one printing, the bot replies with a plain text list
-(showing each match's set) instead of an interactive picker — just add
-the `set` option or re-run with one of the listed card numbers to narrow
-it down.
+**Set release schedule:**
+```
+/release
+```
+Shows upcoming Digimon TCG set release dates (sourced from digimoncard.io's
+set list), including already-announced future sets. If nothing is
+upcoming, it shows the most recent releases instead.
+
+**Official rulings:**
+```
+/ruling card_id:BT4-016
+```
+Looks up official Card Q&A rulings for a specific printing, scraped
+directly from Bandai's own site (world.digimoncard.com). Requires an
+exact card number — use the autocomplete suggestions to get it right.
+Only covers sets in the bot's internal set-code lookup table; if a set
+isn't mapped yet (very new or very obscure releases), you'll get a
+direct link to search manually instead.
+
+Every `/ruling` result pings `@zaneal` and `@taiyoukai99` (resolved to
+real mentions by looking up their username in the server — configurable
+via `RULING_PING_USERNAMES` near the top of `bot.py`), plus a 15% chance
+of also tagging `@finn_thewhoman` as a running joke about his ruling
+track record. If any of these usernames aren't found in the server, the
+bot falls back to plain (non-pinging) text instead of erroring out.
+
+**Alternative Art cycling:**
+When a card has more than one known print (Standard, Alternate Art, Box
+Topper, tournament promos, etc.), the card embed includes **◀ Prev Art**
+/ **Next Art ▶** buttons. Cycling shows the correct rarity and a direct
+link to that exact print's photo on TCGplayer — the underlying card
+image stays the same across variants since neither digimoncard.io nor
+Bandai expose separate art files per print through a public API; the
+TCGplayer link is the only reliable source for the actual distinct photo.
+
+
 
 **Prefix command:**
 ```
