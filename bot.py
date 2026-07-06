@@ -184,6 +184,7 @@ log = logging.getLogger("digimon-bot")
 
 intents = discord.Intents.default()
 intents.message_content = True  # needed for the prefix command
+intents.members = True  # needed to look up users by username for /ruling pings
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -604,14 +605,29 @@ async def card_slash(interaction: discord.Interaction, name: str, set: str = Non
 # Set release schedule
 # --------------------------------------------------------------------------
 
+# Sent with every scraping request (the /packs and rulings pages, unlike
+# the JSON search API, are human-facing pages that some sites treat
+# differently — or outright block — for requests that don't look like a
+# real browser).
+SCRAPE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
 async def fetch_set_schedule(session: aiohttp.ClientSession) -> list[dict]:
     """Scrapes digimoncard.io's Card Sets page (default sort = newest
     first), which lists every set with its release date, including
     already-announced future releases. Returns a list of
     {"name": str, "date": datetime, "date_text": str}."""
     try:
-        async with session.get(PACKS_URL, timeout=15) as resp:
+        async with session.get(PACKS_URL, timeout=15, headers=SCRAPE_HEADERS) as resp:
             if resp.status != 200:
+                log.warning("Set schedule fetch got HTTP %s", resp.status)
                 return []
             html = await resp.text()
     except (asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -621,6 +637,10 @@ async def fetch_set_schedule(session: aiohttp.ClientSession) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
+        log.warning(
+            "Set schedule page fetched OK (%d bytes) but no <table> found — "
+            "page layout may have changed.", len(html)
+        )
         return []
 
     sets = []
@@ -636,6 +656,9 @@ async def fetch_set_schedule(session: aiohttp.ClientSession) -> list[dict]:
         except ValueError:
             continue
         sets.append({"name": name, "date": date_obj, "date_text": date_text})
+
+    if not sets:
+        log.warning("Set schedule table found but no rows parsed successfully.")
     return sets
 
 
@@ -699,8 +722,10 @@ async def fetch_card_ruling(session: aiohttp.ClientSession, card_id: str) -> lis
             OFFICIAL_RULINGS_URL,
             params={"search": "true", "notes": notes_label},
             timeout=15,
+            headers=SCRAPE_HEADERS,
         ) as resp:
             if resp.status != 200:
+                log.warning("Rulings fetch for %s got HTTP %s", card_id, resp.status)
                 return []
             html = await resp.text()
     except (asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -736,7 +761,7 @@ async def fetch_card_ruling(session: aiohttp.ClientSession, card_id: str) -> lis
     return rulings
 
 
-def _resolve_mention(guild: discord.Guild | None, username: str) -> str:
+async def _resolve_mention(guild: discord.Guild | None, username: str) -> str:
     """Looks up a member by their exact Discord username (not display
     name/nickname) and returns a real @mention if found. Falls back to
     plain text if the person isn't in this server or the command was run
@@ -747,16 +772,34 @@ def _resolve_mention(guild: discord.Guild | None, username: str) -> str:
         )
         if member:
             return member.mention
+        # Cache miss (e.g. right after startup, before the member list has
+        # finished populating) — ask Discord directly as a fallback rather
+        # than immediately giving up.
+        try:
+            results = await guild.query_members(query=username, limit=5)
+            match = next(
+                (m for m in results if m.name.lower() == username.lower()), None
+            )
+            if match:
+                return match.mention
+        except discord.HTTPException as e:
+            log.warning("query_members failed for '%s': %s", username, e)
+
+        log.warning(
+            "Couldn't find a member named '%s' in guild '%s' — check the "
+            "username is exactly right and that Server Members Intent is "
+            "enabled in the Discord Developer Portal.", username, guild.name
+        )
     return f"@{username}"
 
 
-def build_ruling_ping_line(guild: discord.Guild | None) -> str:
+async def build_ruling_ping_line(guild: discord.Guild | None) -> str:
     """Builds the mention line attached to every /ruling result: the two
     standing pings, plus a 15% chance of a bonus joke ping."""
-    mentions = [_resolve_mention(guild, u) for u in RULING_PING_USERNAMES]
+    mentions = [await _resolve_mention(guild, u) for u in RULING_PING_USERNAMES]
     line = " ".join(mentions)
     if random.random() < RULING_BONUS_PING_CHANCE:
-        bonus_mention = _resolve_mention(guild, RULING_BONUS_PING_USERNAME)
+        bonus_mention = await _resolve_mention(guild, RULING_BONUS_PING_USERNAME)
         line += f" {bonus_mention} (for incorrect ruling 😏)"
     return line
 
@@ -785,7 +828,7 @@ async def ruling_slash(interaction: discord.Interaction, card_id: str):
     source_url = f"{OFFICIAL_RULINGS_URL}?search=true&notes={notes_label.replace(' ', '+')}"
 
     if not rulings:
-        ping_line = build_ruling_ping_line(interaction.guild)
+        ping_line = await build_ruling_ping_line(interaction.guild)
         await interaction.followup.send(
             f"{ping_line}\n"
             f"No published rulings found for **{card_id}**. "
@@ -809,7 +852,8 @@ async def ruling_slash(interaction: discord.Interaction, card_id: str):
     else:
         embed.set_footer(text="Source: world.digimoncard.com (official)")
 
-    await interaction.followup.send(content=build_ruling_ping_line(interaction.guild), embed=embed)
+    ping_line = await build_ruling_ping_line(interaction.guild)
+    await interaction.followup.send(content=ping_line, embed=embed)
 
 
 # --------------------------------------------------------------------------
