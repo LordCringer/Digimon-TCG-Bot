@@ -64,10 +64,6 @@ ALL_CARDS_URL = "https://digimoncard.io/api-public/getAllCards"
 IMAGE_URL_TEMPLATE = "https://world.digimoncard.com/images/cardlist/card/{code}.png"
 PACKS_URL = "https://digimoncard.io/packs"
 TCGPLAYER_PRODUCT_URL = "https://www.tcgplayer.com/product/{product_id}"
-# TCGplayer's public image CDN — no API key needed, unlike their catalog
-# API. Each TCGplayer product (i.e. each distinct print/art variant) has
-# its own real photo hosted here, keyed by its product id.
-TCGPLAYER_IMAGE_URL_TEMPLATE = "https://tcgplayer-cdn.tcgplayer.com/product/{product_id}_in_1000x1000.jpg"
 OFFICIAL_RULINGS_URL = "https://world.digimoncard.com/cards/"
 
 # Only include cards from the current (2020 reboot) Digimon Card Game.
@@ -325,38 +321,7 @@ def filter_by_set(cards: list[dict], set_query: str) -> list[dict]:
     return results
 
 
-def get_tcgplayer_image_url(product_id: int) -> str:
-    """Builds the direct image URL for one specific TCGplayer listing
-    (i.e. one specific print/art variant)."""
-    return TCGPLAYER_IMAGE_URL_TEMPLATE.format(product_id=product_id)
-
-
-async def resolve_variant_image_url(session: aiohttp.ClientSession, tcgplayer_id: int) -> str | None:
-    """Tries each candidate TCGplayer image URL for this product id and
-    returns the first one that actually loads as an image. This is an
-    unofficial CDN pattern (TCGplayer's real catalog/media API needs
-    OAuth credentials), so it's verified live rather than trusted blindly
-    — if every candidate fails, the caller falls back to the official
-    card image instead of risking a broken embed."""
-    candidates = [
-        f"https://tcgplayer-cdn.tcgplayer.com/product/{tcgplayer_id}_in_1000x1000.jpg",
-        f"https://product-images.tcgplayer.com/fit-in/437x437/{tcgplayer_id}.jpg",
-        f"https://tcgplayer-cdn.tcgplayer.com/product/{tcgplayer_id}_200w.jpg",
-    ]
-    for url in candidates:
-        try:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=4), allow_redirects=True
-            ) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                if resp.status == 200 and content_type.startswith("image"):
-                    return url
-        except (asyncio.TimeoutError, aiohttp.ClientError):
-            continue
-    return None
-
-
-def build_embed(card: dict, variant_index: int = 0, image_url: str | None = None) -> discord.Embed:
+def build_embed(card: dict, variant_index: int = 0) -> discord.Embed:
     color = COLOR_HEX.get(card.get("color"), 0x5865F2)
     sets = ", ".join(sorted(card["set_names"])) or "Unknown set"
 
@@ -370,12 +335,13 @@ def build_embed(card: dict, variant_index: int = 0, image_url: str | None = None
 
     embed = discord.Embed(title=title, color=color)
 
-    # Non-standard prints (Alternate Art, Box Topper, etc.) show that
-    # print's real photo when one was successfully verified (see
-    # resolve_variant_image_url) — otherwise fall back to the one
-    # official image every print shares.
-    used_real_photo = is_alt and image_url is not None
-    embed.set_image(url=image_url or IMAGE_URL_TEMPLATE.format(code=card["id"]))
+    # Every print of a card shares the same official image — neither
+    # digimoncard.io nor Bandai expose separate art files per print
+    # through a public API, and TCGplayer's product photos require API
+    # access we don't have (they've stopped granting new developer keys).
+    # Cycling prints updates the rarity/label/link below; the picture
+    # itself intentionally stays the same.
+    embed.set_image(url=IMAGE_URL_TEMPLATE.format(code=card["id"]))
 
     details = []
     if card.get("type"):
@@ -396,18 +362,17 @@ def build_embed(card: dict, variant_index: int = 0, image_url: str | None = None
 
     if is_alt and variant.get("tcgplayer_id"):
         tcg_url = TCGPLAYER_PRODUCT_URL.format(product_id=variant["tcgplayer_id"])
-        if used_real_photo:
-            field_value = f"[View this listing on TCGplayer]({tcg_url})"
-        else:
-            field_value = (
-                f"Couldn't load this print's photo, showing the standard image instead. "
-                f"[View the real {variant['label']} photo on TCGplayer]({tcg_url})."
-            )
-        embed.add_field(name="Alternate Art", value=field_value, inline=False)
+        embed.add_field(
+            name=f"{variant['label']} Print",
+            value=(
+                f"The image above is the standard print — this bot can't "
+                f"show a separate photo per print. "
+                f"[View the actual {variant['label']} photo on TCGplayer]({tcg_url})."
+            ),
+            inline=False,
+        )
 
     footer = "Card data: digimoncard.io  •  Images: world.digimoncard.com"
-    if used_real_photo:
-        footer += " / TCGplayer"
     if len(variants) > 1:
         footer += f"  •  Print {variant_index + 1}/{len(variants)}"
     embed.set_footer(text=footer)
@@ -415,10 +380,12 @@ def build_embed(card: dict, variant_index: int = 0, image_url: str | None = None
 
 
 class ArtCycleView(discord.ui.View):
-    """Lets the user cycle between known prints/art variants of a card
-    (standard, Alternate Art, Box Topper, event promos, etc.) using
-    Prev/Next buttons. Only attached to a message when a card actually
-    has more than one known variant."""
+    """Lets the user cycle between known prints of a card (Standard,
+    Alternate Art, Box Topper, event promos, etc.) using Prev/Next
+    buttons. Only attached to a message when a card actually has more
+    than one known print. Cycling updates the rarity, print label, and
+    TCGplayer link — not the picture itself, since no free/available
+    source provides a distinct image per print (see build_embed)."""
 
     def __init__(self, card: dict, requester_id: int, variant_index: int = 0):
         super().__init__(timeout=120)
@@ -426,18 +393,18 @@ class ArtCycleView(discord.ui.View):
         self.requester_id = requester_id
         self.variant_index = variant_index
 
-    @discord.ui.button(label="◀ Prev Art", style=discord.ButtonStyle.secondary)
-    async def prev_art(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="◀ Prev Print", style=discord.ButtonStyle.secondary)
+    async def prev_print(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._cycle(interaction, -1)
 
-    @discord.ui.button(label="Next Art ▶", style=discord.ButtonStyle.secondary)
-    async def next_art(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Next Print ▶", style=discord.ButtonStyle.secondary)
+    async def next_print(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._cycle(interaction, 1)
 
     async def _cycle(self, interaction: discord.Interaction, direction: int):
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message(
-                "Only the person who ran the command can cycle art for this card.",
+                "Only the person who ran the command can cycle prints for this card.",
                 ephemeral=True,
             )
             return
@@ -446,22 +413,9 @@ class ArtCycleView(discord.ui.View):
             await interaction.response.defer()
             return
 
-        # Verifying the TCGplayer image needs a network round-trip, so
-        # defer first (buys up to 15 minutes instead of Discord's normal
-        # 3-second response window) and edit the original message once
-        # we know which image URL is actually usable.
-        await interaction.response.defer()
-
         self.variant_index = (self.variant_index + direction) % len(variants)
-        variant = variants[self.variant_index]
-
-        image_url = None
-        if variant["label"] != "Standard" and variant.get("tcgplayer_id"):
-            async with aiohttp.ClientSession() as session:
-                image_url = await resolve_variant_image_url(session, variant["tcgplayer_id"])
-
-        embed = build_embed(self.card, self.variant_index, image_url=image_url)
-        await interaction.edit_original_response(embed=embed, view=self)
+        embed = build_embed(self.card, self.variant_index)
+        await interaction.response.edit_message(embed=embed, view=self)
 
 
 def format_matches_message(query: str, cards: list[dict]) -> str:

@@ -51,14 +51,17 @@ of also tagging `@finn_thewhoman` as a running joke about his ruling
 track record. If any of these usernames aren't found in the server, the
 bot falls back to plain (non-pinging) text instead of erroring out.
 
-**Alternative Art cycling:**
+**Print cycling:**
 When a card has more than one known print (Standard, Alternate Art, Box
-Topper, tournament promos, etc.), the card embed includes **◀ Prev Art**
-/ **Next Art ▶** buttons. Cycling shows the correct rarity and a direct
-link to that exact print's photo on TCGplayer — the underlying card
-image stays the same across variants since neither digimoncard.io nor
-Bandai expose separate art files per print through a public API; the
-TCGplayer link is the only reliable source for the actual distinct photo.
+Topper, tournament promos, etc.), the card embed includes **◀ Prev Print**
+/ **Next Print ▶** buttons. Cycling updates the rarity, print label, and
+a direct link to that exact print's listing on TCGplayer. The image
+itself intentionally stays the same across prints — neither
+digimoncard.io nor Bandai expose a separate photo per print through any
+public API, and TCGplayer's real product photos require API access
+(TCGplayer has stopped granting new developer credentials, so this isn't
+available to the bot). The TCGplayer link in each print's field is the
+only way to see that print's actual distinct artwork.
 
 
 
