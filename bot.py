@@ -185,6 +185,29 @@ intents.members = True  # needed to look up users by username for /ruling pings
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Global safety net for every slash command. Without this, an
+    unhandled exception after interaction.response.defer() leaves Discord
+    showing "thinking..." forever, since nothing else automatically sends
+    a followup. This guarantees the user always gets *some* reply, and
+    logs the full traceback so the real cause shows up in `docker compose
+    logs` instead of failing silently."""
+    log.exception(
+        "Unhandled error in /%s",
+        interaction.command.name if interaction.command else "?",
+        exc_info=error,
+    )
+    message = "Something went wrong running that command. Please try again."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 # --------------------------------------------------------------------------
 # Data fetching / normalizing
 # --------------------------------------------------------------------------
@@ -413,9 +436,17 @@ class ArtCycleView(discord.ui.View):
             await interaction.response.defer()
             return
 
-        self.variant_index = (self.variant_index + direction) % len(variants)
-        embed = build_embed(self.card, self.variant_index)
-        await interaction.response.edit_message(embed=embed, view=self)
+        try:
+            self.variant_index = (self.variant_index + direction) % len(variants)
+            embed = build_embed(self.card, self.variant_index)
+            await interaction.response.edit_message(embed=embed, view=self)
+        except Exception:
+            log.exception("Unhandled error cycling prints for card id=%r", self.card.get("id"))
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Something went wrong showing that print. Please try again.",
+                    ephemeral=True,
+                )
 
 
 def format_matches_message(query: str, cards: list[dict]) -> str:
@@ -540,19 +571,40 @@ async def name_autocomplete(
 @app_commands.autocomplete(name=name_autocomplete)
 async def card_slash(interaction: discord.Interaction, name: str, set: str = None):
     await interaction.response.defer()
-    card, matches, error = await do_lookup(name, set)
+    try:
+        card, matches, error = await do_lookup(name, set)
 
-    if error:
-        await interaction.followup.send(error)
-        return
+        if error:
+            await interaction.followup.send(error)
+            return
 
-    if card:
-        embed = build_embed(card)
-        view = ArtCycleView(card, interaction.user.id) if len(card.get("variants") or []) > 1 else None
-        await interaction.followup.send(embed=embed, view=view)
-        return
+        if card:
+            embed = build_embed(card)
+            has_multiple_prints = len(card.get("variants") or []) > 1
+            if has_multiple_prints:
+                view = ArtCycleView(card, interaction.user.id)
+                await interaction.followup.send(embed=embed, view=view)
+            else:
+                # Newer discord.py rejects an explicit view=None — the
+                # kwarg must be omitted entirely when there's no view.
+                await interaction.followup.send(embed=embed)
+            return
 
-    await interaction.followup.send(format_matches_message(name, matches))
+        await interaction.followup.send(format_matches_message(name, matches))
+
+    except Exception:
+        # Guarantees the interaction always gets a reply — without this,
+        # any unhandled error here leaves Discord stuck showing
+        # "thinking..." forever, since defer() already consumed the
+        # initial acknowledgment and nothing else follows up on its own.
+        log.exception("Unhandled error in /card for name=%r set=%r", name, set)
+        try:
+            await interaction.followup.send(
+                "Something went wrong looking that up. Please try again — "
+                "if it keeps happening, check the bot's logs for the exact error."
+            )
+        except discord.HTTPException:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -619,32 +671,42 @@ async def fetch_set_schedule(session: aiohttp.ClientSession) -> list[dict]:
 @bot.tree.command(name="release", description="Show upcoming Digimon TCG set release dates.")
 async def release_slash(interaction: discord.Interaction):
     await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            sets = await fetch_set_schedule(session)
 
-    async with aiohttp.ClientSession() as session:
-        sets = await fetch_set_schedule(session)
+        if not sets:
+            await interaction.followup.send(
+                "Couldn't fetch the release schedule right now. Try again later."
+            )
+            return
 
-    if not sets:
-        await interaction.followup.send(
-            "Couldn't fetch the release schedule right now. Try again later."
-        )
-        return
+        now = datetime.now(timezone.utc)
+        upcoming = sorted((s for s in sets if s["date"] >= now), key=lambda s: s["date"])
 
-    now = datetime.now(timezone.utc)
-    upcoming = sorted((s for s in sets if s["date"] >= now), key=lambda s: s["date"])
+        embed = discord.Embed(title="📅 Upcoming Digimon TCG Set Releases", color=0x5865F2)
 
-    embed = discord.Embed(title="📅 Upcoming Digimon TCG Set Releases", color=0x5865F2)
+        if upcoming:
+            lines = [f"**{s['date_text']}** — {s['name']}" for s in upcoming[:12]]
+            embed.description = "\n".join(lines)
+        else:
+            # Nothing announced yet — show the most recent releases instead
+            recent = sorted(sets, key=lambda s: s["date"], reverse=True)[:8]
+            lines = [f"**{s['date_text']}** — {s['name']}" for s in recent]
+            embed.description = "No upcoming releases are announced yet. Most recent sets:\n" + "\n".join(lines)
 
-    if upcoming:
-        lines = [f"**{s['date_text']}** — {s['name']}" for s in upcoming[:12]]
-        embed.description = "\n".join(lines)
-    else:
-        # Nothing announced yet — show the most recent releases instead
-        recent = sorted(sets, key=lambda s: s["date"], reverse=True)[:8]
-        lines = [f"**{s['date_text']}** — {s['name']}" for s in recent]
-        embed.description = "No upcoming releases are announced yet. Most recent sets:\n" + "\n".join(lines)
+        embed.set_footer(text="Source: digimoncard.io/packs")
+        await interaction.followup.send(embed=embed)
 
-    embed.set_footer(text="Source: digimoncard.io/packs")
-    await interaction.followup.send(embed=embed)
+    except Exception:
+        log.exception("Unhandled error in /release")
+        try:
+            await interaction.followup.send(
+                "Something went wrong fetching the schedule. Please try again — "
+                "if it keeps happening, check the bot's logs for the exact error."
+            )
+        except discord.HTTPException:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -728,33 +790,47 @@ async def _resolve_mention(guild: discord.Guild | None, username: str) -> str:
             return member.mention
         # Cache miss (e.g. right after startup, before the member list has
         # finished populating) — ask Discord directly as a fallback rather
-        # than immediately giving up.
+        # than immediately giving up. Bounded to a short timeout so a slow
+        # or empty response can't stall the whole command.
         try:
-            results = await guild.query_members(query=username, limit=5)
+            results = await asyncio.wait_for(
+                guild.query_members(query=username, limit=5), timeout=3.0
+            )
             match = next(
                 (m for m in results if m.name.lower() == username.lower()), None
             )
             if match:
                 return match.mention
-        except discord.HTTPException as e:
+        except Exception as e:
+            # Deliberately broad: a failed ping lookup should never be
+            # able to take down the whole /ruling command. Whatever went
+            # wrong, log it and fall through to the plain-text fallback.
             log.warning("query_members failed for '%s': %s", username, e)
 
         log.warning(
-            "Couldn't find a member named '%s' in guild '%s' — check the "
-            "username is exactly right and that Server Members Intent is "
-            "enabled in the Discord Developer Portal.", username, guild.name
+            "Couldn't find a member named '%s' in guild '%s' — double check "
+            "this is their exact Discord username (not nickname/display "
+            "name), and that Server Members Intent is enabled in the "
+            "Discord Developer Portal.", username, guild.name
         )
     return f"@{username}"
 
 
 async def build_ruling_ping_line(guild: discord.Guild | None) -> str:
     """Builds the mention line attached to every /ruling result: the two
-    standing pings, plus a 15% chance of a bonus joke ping."""
-    mentions = [await _resolve_mention(guild, u) for u in RULING_PING_USERNAMES]
-    line = " ".join(mentions)
-    if random.random() < RULING_BONUS_PING_CHANCE:
-        bonus_mention = await _resolve_mention(guild, RULING_BONUS_PING_USERNAME)
-        line += f" {bonus_mention} (for incorrect ruling 😏)"
+    standing pings, plus a 15% chance of a bonus joke ping. Resolves all
+    usernames concurrently rather than one at a time, since each lookup
+    can involve its own round-trip to Discord."""
+    include_bonus = random.random() < RULING_BONUS_PING_CHANCE
+    usernames = list(RULING_PING_USERNAMES)
+    if include_bonus:
+        usernames.append(RULING_BONUS_PING_USERNAME)
+
+    mentions = await asyncio.gather(*(_resolve_mention(guild, u) for u in usernames))
+
+    line = " ".join(mentions[:len(RULING_PING_USERNAMES)])
+    if include_bonus:
+        line += f" {mentions[-1]} (for incorrect ruling 😏)"
     return line
 
 
@@ -767,47 +843,63 @@ async def ruling_slash(interaction: discord.Interaction, card_id: str):
     await interaction.response.defer()
     card_id = card_id.strip()
 
-    set_code = _set_code_from_card_id(card_id)
-    if not set_code or set_code not in SET_NOTES_MAP:
-        await interaction.followup.send(
-            f"I don't have a rulings lookup mapped for that card's set yet. "
-            f"You can search manually at {OFFICIAL_RULINGS_URL}?search=true"
+    try:
+        set_code = _set_code_from_card_id(card_id)
+        if not set_code or set_code not in SET_NOTES_MAP:
+            await interaction.followup.send(
+                f"I don't have a rulings lookup mapped for that card's set yet. "
+                f"You can search manually at {OFFICIAL_RULINGS_URL}?search=true"
+            )
+            return
+
+        async with aiohttp.ClientSession() as session:
+            rulings, ping_line = await asyncio.gather(
+                fetch_card_ruling(session, card_id),
+                build_ruling_ping_line(interaction.guild),
+            )
+
+        notes_label = SET_NOTES_MAP[set_code]
+        source_url = f"{OFFICIAL_RULINGS_URL}?search=true&notes={notes_label.replace(' ', '+')}"
+
+        if not rulings:
+            await interaction.followup.send(
+                f"{ping_line}\n"
+                f"No published rulings found for **{card_id}**. "
+                f"Either none have been issued yet, or you can double check on the official set page: {source_url}"
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"📖 Official Rulings — {card_id}",
+            color=0x5865F2,
+            description=f"[View full set rulings page]({source_url})",
         )
-        return
+        for ruling in rulings[:5]:
+            embed.add_field(
+                name=f"Q{ruling['id']} ({ruling['date']})",
+                value=ruling["text"][:1000],
+                inline=False,
+            )
+        if len(rulings) > 5:
+            embed.set_footer(text=f"+{len(rulings) - 5} more — see the full set page above.")
+        else:
+            embed.set_footer(text="Source: world.digimoncard.com (official)")
 
-    async with aiohttp.ClientSession() as session:
-        rulings = await fetch_card_ruling(session, card_id)
+        await interaction.followup.send(content=ping_line, embed=embed)
 
-    notes_label = SET_NOTES_MAP[set_code]
-    source_url = f"{OFFICIAL_RULINGS_URL}?search=true&notes={notes_label.replace(' ', '+')}"
-
-    if not rulings:
-        ping_line = await build_ruling_ping_line(interaction.guild)
-        await interaction.followup.send(
-            f"{ping_line}\n"
-            f"No published rulings found for **{card_id}**. "
-            f"Either none have been issued yet, or you can double check on the official set page: {source_url}"
-        )
-        return
-
-    embed = discord.Embed(
-        title=f"📖 Official Rulings — {card_id}",
-        color=0x5865F2,
-        description=f"[View full set rulings page]({source_url})",
-    )
-    for ruling in rulings[:5]:
-        embed.add_field(
-            name=f"Q{ruling['id']} ({ruling['date']})",
-            value=ruling["text"][:1000],
-            inline=False,
-        )
-    if len(rulings) > 5:
-        embed.set_footer(text=f"+{len(rulings) - 5} more — see the full set page above.")
-    else:
-        embed.set_footer(text="Source: world.digimoncard.com (official)")
-
-    ping_line = await build_ruling_ping_line(interaction.guild)
-    await interaction.followup.send(content=ping_line, embed=embed)
+    except Exception:
+        # Guarantees the interaction ALWAYS gets a reply — without this,
+        # any unhandled error here leaves Discord showing "thinking..."
+        # indefinitely, since defer() already consumed the initial
+        # acknowledgment and nothing else follows up automatically.
+        log.exception("Unhandled error in /ruling for card_id=%r", card_id)
+        try:
+            await interaction.followup.send(
+                "Something went wrong looking that up. Please try again — "
+                "if it keeps happening, check the bot's logs for the exact error."
+            )
+        except discord.HTTPException:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -831,8 +923,12 @@ async def card_prefix(ctx: commands.Context, *, query: str):
 
     if card:
         embed = build_embed(card)
-        view = ArtCycleView(card, ctx.author.id) if len(card.get("variants") or []) > 1 else None
-        await ctx.send(embed=embed, view=view)
+        has_multiple_prints = len(card.get("variants") or []) > 1
+        if has_multiple_prints:
+            view = ArtCycleView(card, ctx.author.id)
+            await ctx.send(embed=embed, view=view)
+        else:
+            await ctx.send(embed=embed)
         return
 
     await ctx.send(format_matches_message(name, matches))
